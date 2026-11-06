@@ -1,0 +1,44 @@
+# Sobe a TestFlight o .ipa adxunto a unha release deste repositorio, cun Mac
+# de GitHub (Apple só deixa subir dende macOS).
+#
+# Segredos do repositorio: ASC_KEY_ID, ASC_ISSUER_ID e ASC_KEY_P8 (o .p8 enteiro).
+name: Subir a TestFlight
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: "Etiqueta da release co .ipa"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  subir:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Baixar o .ipa da release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIQUETA: ${{ github.event.release.tag_name || inputs.etiqueta }}
+        run: |
+          gh release download "$ETIQUETA" --repo "$GITHUB_REPOSITORY" --pattern "*.ipa" --dir ipa
+          ls -la ipa
+
+      - name: Subir con altool
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          CLAVE=~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          printf '%s\n' "$ASC_KEY_P8" > "$CLAVE"
+          trap 'rm -f "$CLAVE"' EXIT
+          IPA=$(ls ipa/*.ipa | head -n 1)
+          xcrun altool --upload-app --type ios --file "$IPA" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
