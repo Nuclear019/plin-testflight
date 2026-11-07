@@ -1,7 +1,13 @@
-# Sobe a TestFlight o .ipa adxunto a unha release deste repositorio, cun Mac
-# de GitHub (Apple só deixa subir dende macOS).
+# Sobe Plin a TestFlight cun Mac de GitHub (Apple só deixa compilar e subir
+# dende macOS). Lánzase ao publicar unha release con un destes adxuntos:
+#   - PlinIOS.tar.gz: o proxecto de Xcode exportado por Unity en Windows.
+#     Aquí compílase, asínase e sóbese.
+#   - un .ipa xa feito (por exemplo, o de Unity DevOps): só se sobe.
 #
-# Segredos do repositorio: ASC_KEY_ID, ASC_ISSUER_ID e ASC_KEY_P8 (o .p8 enteiro).
+# Segredos do repositorio:
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8   a clave da API de App Store Connect
+#   P12_BASE64, P12_CLAVE                   o certificado de distribución e a súa contrasinal
+#   PERFIL_BASE64                           o perfil App Store (.mobileprovision)
 name: Subir a TestFlight
 
 on:
@@ -10,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       etiqueta:
-        description: "Etiqueta da release co .ipa"
+        description: "Etiqueta da release"
         required: true
 
 permissions:
@@ -19,15 +25,138 @@ permissions:
 jobs:
   subir:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
-      - name: Baixar o .ipa da release
+      - name: Baixar o adxunto da release
         env:
           GH_TOKEN: ${{ github.token }}
           ETIQUETA: ${{ github.event.release.tag_name || inputs.etiqueta }}
         run: |
-          gh release download "$ETIQUETA" --repo "$GITHUB_REPOSITORY" --pattern "*.ipa" --dir ipa
-          ls -la ipa
+          gh release download "$ETIQUETA" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/entrada"
+          ls -la "$RUNNER_TEMP/entrada"
+          IPA=$(ls "$RUNNER_TEMP"/entrada/*.ipa 2>/dev/null | head -n 1 || true)
+          if [ -n "$IPA" ]; then
+            echo "IPA=$IPA" >> "$GITHUB_ENV"
+            echo "Hai un .ipa: só se sobe."
+          else
+            TGZ=$(ls "$RUNNER_TEMP"/entrada/*.tar.gz | head -n 1)
+            mkdir -p "$RUNNER_TEMP/proxecto"
+            tar -xzf "$TGZ" -C "$RUNNER_TEMP/proxecto"
+            PROXECTO=$(dirname "$(find "$RUNNER_TEMP/proxecto" -maxdepth 3 -name Unity-iPhone.xcodeproj | head -n 1)")
+            echo "PROXECTO=$PROXECTO" >> "$GITHUB_ENV"
+            echo "Proxecto de Xcode en $PROXECTO: compílase."
+          fi
+
+      - name: Certificado e perfil
+        if: env.PROXECTO != ''
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_CLAVE: ${{ secrets.P12_CLAVE }}
+          PERFIL_BASE64: ${{ secrets.PERFIL_BASE64 }}
+        run: |
+          # Un chaveiro propio, só para esta execución.
+          KC="$RUNNER_TEMP/plin.keychain-db"
+          KCP=$(uuidgen)
+          security create-keychain -p "$KCP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCP" "$KC"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/plin.p12"
+          security import "$RUNNER_TEMP/plin.p12" -P "$P12_CLAVE" -A -t cert -f pkcs12 -k "$KC"
+          rm -f "$RUNNER_TEMP/plin.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KCP" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          IDENTIDADE=$(security find-identity -v -p codesigning "$KC" | grep -o '"[^"]*"' | head -n 1 | tr -d '"')
+          [ -n "$IDENTIDADE" ] || { echo "O .p12 non trae ningún certificado para asinar."; exit 1; }
+          echo "Certificado: $IDENTIDADE"
+
+          # O perfil, onde o busca Xcode.
+          printf '%s' "$PERFIL_BASE64" | base64 --decode > "$RUNNER_TEMP/perfil.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/perfil.mobileprovision" > "$RUNNER_TEMP/perfil.plist"
+          PERFIL_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$RUNNER_TEMP/perfil.plist")
+          PERFIL_NOME=$(/usr/libexec/PlistBuddy -c 'Print Name' "$RUNNER_TEMP/perfil.plist")
+          EQUIPO=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' "$RUNNER_TEMP/perfil.plist")
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$d"
+            cp "$RUNNER_TEMP/perfil.mobileprovision" "$d/$PERFIL_UUID.mobileprovision"
+          done
+          echo "Perfil: $PERFIL_NOME ($PERFIL_UUID), equipo $EQUIPO"
+
+          {
+            echo "KC=$KC"
+            echo "IDENTIDADE=$IDENTIDADE"
+            echo "PERFIL_UUID=$PERFIL_UUID"
+            echo "PERFIL_NOME=$PERFIL_NOME"
+            echo "EQUIPO=$EQUIPO"
+          } >> "$GITHUB_ENV"
+
+      - name: Preparar o proxecto
+        if: env.PROXECTO != ''
+        working-directory: ${{ env.PROXECTO }}
+        run: |
+          # Número de build sempre maior ca o anterior, sen ter que tocalo en Unity.
+          BUILD="1.$(date -u +%y%m%d).$(date -u +%H%M)"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" Info.plist
+          echo "Build: $BUILD"
+
+          # Firma manual só na app; o framework de Unity asínase ao meterse nela.
+          cat > "$RUNNER_TEMP/firma.rb" <<'RUBY'
+          require 'xcodeproj'
+          p = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
+          p.targets.each do |t|
+            t.build_configurations.each do |c|
+              s = c.build_settings
+              s['DEVELOPMENT_TEAM'] = ENV['EQUIPO']
+              s['CODE_SIGN_STYLE'] = 'Manual'
+              s['CODE_SIGN_IDENTITY'] = ENV['IDENTIDADE']
+              s['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = ENV['IDENTIDADE']
+              if t.name == 'Unity-iPhone'
+                s['PROVISIONING_PROFILE_SPECIFIER'] = ENV['PERFIL_NOME']
+                s['PROVISIONING_PROFILE'] = ENV['PERFIL_UUID']
+                s['PROVISIONING_PROFILE_APP'] = ENV['PERFIL_UUID']
+              else
+                s['PROVISIONING_PROFILE_SPECIFIER'] = ''
+                s['PROVISIONING_PROFILE'] = ''
+              end
+            end
+          end
+          p.save
+          RUBY
+          ruby "$RUNNER_TEMP/firma.rb"
+
+          pod install
+
+      - name: Compilar
+        if: env.PROXECTO != ''
+        working-directory: ${{ env.PROXECTO }}
+        run: |
+          xcodebuild -workspace Unity-iPhone.xcworkspace -scheme Unity-iPhone \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Plin.xcarchive" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KC" \
+            -quiet archive
+
+          cat > "$RUNNER_TEMP/exportar.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$EQUIPO</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>$IDENTIDADE</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.nucestudio.plin</key><string>$PERFIL_NOME</string>
+            </dict>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Plin.xcarchive" \
+            -exportPath "$RUNNER_TEMP/saida" -exportOptionsPlist "$RUNNER_TEMP/exportar.plist"
+          echo "IPA=$(ls "$RUNNER_TEMP"/saida/*.ipa | head -n 1)" >> "$GITHUB_ENV"
 
       - name: Subir con altool
         env:
@@ -39,6 +168,10 @@ jobs:
           CLAVE=~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
           printf '%s\n' "$ASC_KEY_P8" > "$CLAVE"
           trap 'rm -f "$CLAVE"' EXIT
-          IPA=$(ls ipa/*.ipa | head -n 1)
+          echo "Subindo $IPA"
           xcrun altool --upload-app --type ios --file "$IPA" \
             --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Borrar o chaveiro
+        if: always() && env.KC != ''
+        run: security delete-keychain "$KC" || true
