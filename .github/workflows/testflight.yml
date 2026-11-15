@@ -4,6 +4,10 @@
 #     Aquí compílase, asínase e sóbese.
 #   - un .ipa xa feito (por exemplo, o de Unity DevOps): só se sobe.
 #
+# Por defecto a build sobe SEN avisar aos testers (apágase "Notificar aos
+# testers automaticamente" en App Store Connect). Para avisalos: pon #notificar
+# nas notas da release, ou marca "notificar" ao lanzalo a man.
+#
 # Segredos do repositorio:
 #   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8   a clave da API de App Store Connect
 #   P12_BASE64, P12_CLAVE                   o certificado de distribución e a súa contrasinal
@@ -18,6 +22,10 @@ on:
       etiqueta:
         description: "Etiqueta da release"
         required: true
+      notificar:
+        description: "Avisar aos testers"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,6 +34,8 @@ jobs:
   subir:
     runs-on: macos-latest
     timeout-minutes: 120
+    env:
+      NOTIFICAR: ${{ inputs.notificar == true || contains(github.event.release.body, '#notificar') }}
     steps:
       - name: Baixar o adxunto da release
         env:
@@ -98,6 +108,7 @@ jobs:
           BUILD="1.$(date -u +%y%m%d).$(date -u +%H%M)"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" Info.plist
           echo "Build: $BUILD"
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
 
           # Firma manual só na app; o framework de Unity asínase ao meterse nela.
           cat > "$RUNNER_TEMP/firma.rb" <<'RUBY'
@@ -171,6 +182,63 @@ jobs:
           echo "Subindo $IPA"
           xcrun altool --upload-app --type ios --file "$IPA" \
             --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Sen avisar aos testers
+        if: env.NOTIFICAR != 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          BUNDLE_ID: com.nucestudio.plin
+        run: |
+          # Co .ipa xa feito, o número de build vén dentro del.
+          if [ -z "$BUILD" ]; then
+            unzip -o -q "$IPA" 'Payload/*.app/Info.plist' -d "$RUNNER_TEMP/ipa"
+            BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$RUNNER_TEMP"/ipa/Payload/*.app/Info.plist)
+            export BUILD
+          fi
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet "pyjwt[crypto]"
+          "$RUNNER_TEMP/venv/bin/python" - <<'PY'
+          # Agarda a que App Store Connect vexa a build (aínda procesándose) e
+          # apágalle o aviso automático aos testers. Ten que ser antes de que
+          # remate de procesarse: é cando se avisa.
+          import json, os, time, urllib.parse, urllib.request
+          import jwt
+
+          API = "https://api.appstoreconnect.apple.com/v1"
+
+          def token():
+              agora = int(time.time())
+              return jwt.encode(
+                  {"iss": os.environ["ASC_ISSUER_ID"], "iat": agora, "exp": agora + 1200, "aud": "appstoreconnect-v1"},
+                  os.environ["ASC_KEY_P8"], algorithm="ES256", headers={"kid": os.environ["ASC_KEY_ID"], "typ": "JWT"})
+
+          def pedir(metodo, ruta, corpo=None):
+              datos = json.dumps(corpo).encode() if corpo is not None else None
+              req = urllib.request.Request(API + ruta, data=datos, method=metodo,
+                  headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          build = os.environ["BUILD"]
+          app = pedir("GET", "/apps?" + urllib.parse.urlencode({"filter[bundleId]": os.environ["BUNDLE_ID"]}))["data"][0]["id"]
+          print(f"Agardando á build {build}...")
+          detalle = None
+          for _ in range(80):  # ata 40 minutos
+              r = pedir("GET", "/builds?" + urllib.parse.urlencode(
+                  {"filter[app]": app, "filter[version]": build, "include": "buildBetaDetail"}))
+              if r["data"]:
+                  detalle = r["data"][0]["relationships"]["buildBetaDetail"]["data"]["id"]
+                  break
+              time.sleep(30)
+          if detalle is None:
+              raise SystemExit(f"A build {build} non apareceu en App Store Connect: non se puido quitar o aviso.")
+
+          pedir("PATCH", f"/buildBetaDetails/{detalle}",
+              {"data": {"type": "buildBetaDetails", "id": detalle, "attributes": {"autoNotifyEnabled": False}}})
+          print(f"Build {build}: sobe sen avisar aos testers.")
+          PY
 
       - name: Borrar o chaveiro
         if: always() && env.KC != ''
