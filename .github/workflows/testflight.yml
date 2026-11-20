@@ -1,7 +1,8 @@
 # Sobe Plin a TestFlight cun Mac de GitHub (Apple só deixa compilar e subir
 # dende macOS). Lánzase ao publicar unha release con un destes adxuntos:
-#   - PlinIOS.tar.gz: o proxecto de Xcode exportado por Unity en Windows.
-#     Aquí compílase, asínase e sóbese.
+#   - PlinIOS.tar.gz.enc: o proxecto de Xcode exportado por Unity en Windows,
+#     cifrado (por se o repositorio se fai público). Aquí descífrase,
+#     compílase, asínase e sóbese. (Un PlinIOS.tar.gz sen cifrar tamén vale.)
 #   - un .ipa xa feito (por exemplo, o de Unity DevOps): só se sobe.
 #
 # Por defecto a build sobe SEN avisar aos testers (apágase "Notificar aos
@@ -12,6 +13,7 @@
 #   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8   a clave da API de App Store Connect
 #   P12_BASE64, P12_CLAVE                   o certificado de distribución e a súa contrasinal
 #   PERFIL_BASE64                           o perfil App Store (.mobileprovision)
+#   PAQUETE_CLAVE                           o contrasinal do paquete cifrado (o de paquete.clave)
 name: Subir a TestFlight
 
 on:
@@ -37,10 +39,27 @@ jobs:
     env:
       NOTIFICAR: ${{ inputs.notificar == true || contains(github.event.release.body, '#notificar') }}
     steps:
+      # Apple pide o SDK de iOS 27 (Xcode 27) dende abril de 2027. O Mac de
+      # GitHub pode ter varios Xcode e non sempre usa o máis novo: escóllese o
+      # Xcode 27 (ou posterior) máis alto que haxa; se non hai, segue co de
+      # sempre e avisa.
+      - name: Escoller o Xcode máis novo
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null \
+            | grep -E 'Xcode_(2[7-9]|[3-9][0-9])' | grep -viE 'beta|rc' | sort -V | tail -n 1 || true)
+          if [ -n "$XCODE" ]; then
+            sudo xcode-select -s "$XCODE/Contents/Developer"
+          else
+            echo "::warning::Non hai Xcode 27 neste Mac: compílase co de sempre (dende abril de 2027 Apple non o aceptará)."
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
       - name: Baixar o adxunto da release
         env:
           GH_TOKEN: ${{ github.token }}
           ETIQUETA: ${{ github.event.release.tag_name || inputs.etiqueta }}
+          PAQUETE_CLAVE: ${{ secrets.PAQUETE_CLAVE }}
         run: |
           gh release download "$ETIQUETA" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/entrada"
           ls -la "$RUNNER_TEMP/entrada"
@@ -49,7 +68,18 @@ jobs:
             echo "IPA=$IPA" >> "$GITHUB_ENV"
             echo "Hai un .ipa: só se sobe."
           else
-            TGZ=$(ls "$RUNNER_TEMP"/entrada/*.tar.gz | head -n 1)
+            ENC=$(ls "$RUNNER_TEMP"/entrada/*.tar.gz.enc 2>/dev/null | head -n 1 || true)
+            if [ -n "$ENC" ]; then
+              # O openssl 3 de Homebrew (o do sistema é LibreSSL); os mesmos
+              # parámetros ca ao cifrar en Windows.
+              OPENSSL=$(brew --prefix openssl@3 2>/dev/null)/bin/openssl
+              [ -x "$OPENSSL" ] || OPENSSL=openssl
+              "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256                 -in "$ENC" -out "$RUNNER_TEMP/PlinIOS.tar.gz" -pass env:PAQUETE_CLAVE
+              rm -f "$ENC"
+              TGZ="$RUNNER_TEMP/PlinIOS.tar.gz"
+            else
+              TGZ=$(ls "$RUNNER_TEMP"/entrada/*.tar.gz | head -n 1)
+            fi
             mkdir -p "$RUNNER_TEMP/proxecto"
             tar -xzf "$TGZ" -C "$RUNNER_TEMP/proxecto"
             PROXECTO=$(dirname "$(find "$RUNNER_TEMP/proxecto" -maxdepth 3 -name Unity-iPhone.xcodeproj | head -n 1)")
